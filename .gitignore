@@ -1,4 +1,3 @@
-*.db
 *.json
 !package.json
 __pycache__/
