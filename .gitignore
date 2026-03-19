@@ -1,6 +1,6 @@
-network_log.json
-network_log.json.tmp
-products.json
+*.db
+*.json
+!package.json
 __pycache__/
 *.pyc
 .claude/
