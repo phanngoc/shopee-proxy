@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Shopee Network Capture",
+  "version": "2.2",
+  "description": "Captures API requests + response bodies + cookies",
+  "permissions": ["scripting", "tabs", "webNavigation", "cookies"],
+  "host_permissions": ["*://*.shopee.vn/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.shopee.vn/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

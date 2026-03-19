@@ -1,0 +1,6 @@
+network_log.json
+network_log.json.tmp
+products.json
+__pycache__/
+*.pyc
+.claude/
