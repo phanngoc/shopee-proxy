@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Shopee Network Proxy — auto-capture & extract products to SQLite.
+Shopee Product Proxy — auto-capture & extract products to SQLite.
 
 Chrome extension intercepts API requests while you browse Shopee normally.
-When recommend_v2 responses arrive, products are automatically parsed and
-saved to SQLite. Just browse — data appears instantly.
+Products from recommend_v2 and search_items are auto-parsed into SQLite.
 
 Usage:
     python3 proxy.py [--db products.db] [--port 9234]
@@ -18,23 +17,28 @@ import sys
 from argparse import ArgumentParser
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 DEFAULT_DB = "products.db"
 DEFAULT_PORT = 9234
 IMAGE_BASE = "https://down-vn.img.susercontent.com/file/"
 
+# APIs that contain product listings
+PRODUCT_APIS = ["recommend/recommend_v2", "search/search_items"]
+
 console = Console()
 
 # ─── State ─────────────────────────────────────────────────────────────────────
 db_conn: sqlite3.Connection | None = None
-counter = 0
 product_count = 0
+counter = 0
 
+
+# ─── Database ──────────────────────────────────────────────────────────────────
 
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -59,7 +63,39 @@ def init_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def parse_product(unit: dict) -> dict | None:
+def insert_products(products: list[dict], cat_id: str) -> int:
+    """Insert products into DB, return count of new inserts."""
+    global product_count
+    now = datetime.now().isoformat()
+    new_count = 0
+
+    for p in products:
+        try:
+            before = db_conn.total_changes
+            db_conn.execute(
+                """INSERT OR IGNORE INTO products
+                   (item_id, shop_id, name, price, original_price, discount,
+                    sold, seller_type, image, images, url, category_id, captured_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (p["item_id"], p["shop_id"], p["name"], p["price"],
+                 p["original_price"], p["discount"], p["sold"],
+                 p["seller_type"], p["image"], p["images"], p["url"],
+                 cat_id, now),
+            )
+            if db_conn.total_changes > before:
+                new_count += 1
+        except Exception:
+            pass
+
+    db_conn.commit()
+    product_count += new_count
+    return new_count
+
+
+# ─── Parsers ───────────────────────────────────────────────────────────────────
+
+def parse_recommend_product(unit: dict) -> dict | None:
+    """Parse product from recommend_v2 response unit."""
     item = unit.get("item", {})
     asset = item.get("item_card_displayed_asset", {})
     item_data = item.get("item_data", {})
@@ -73,94 +109,124 @@ def parse_product(unit: dict) -> dict | None:
         return None
 
     price_raw = asset.get("display_price", {}).get("price", 0)
-    price = price_raw / 100000
-
     strikethrough = asset.get("display_price", {}).get("strikethrough_price", 0) or 0
-    original_price = strikethrough / 100000 if strikethrough else None
 
     discount_tag = asset.get("discount_tag")
-    discount = discount_tag.get("discount_text", "") if discount_tag else ""
-
     sold_count = asset.get("sold_count")
-    sold = sold_count.get("text", "") if sold_count else ""
-
+    seller = asset.get("seller_flag")
     image = asset.get("image", "")
     images = asset.get("images", [])
 
-    seller = asset.get("seller_flag")
-    seller_type = seller.get("name", "") if seller else ""
+    return {
+        "item_id": item_id,
+        "shop_id": str(item_data.get("shopid", "")),
+        "name": asset.get("name", ""),
+        "price": price_raw / 100000,
+        "original_price": strikethrough / 100000 if strikethrough else None,
+        "discount": discount_tag.get("discount_text", "") if discount_tag else "",
+        "sold": sold_count.get("text", "") if sold_count else "",
+        "seller_type": seller.get("name", "") if seller else "",
+        "image": f"{IMAGE_BASE}{image}" if image else "",
+        "images": json.dumps([f"{IMAGE_BASE}{i}" for i in images]),
+        "url": f"https://shopee.vn/product/{item_data.get('shopid','')}/{item_id}",
+    }
 
-    shop_id = str(item_data.get("shopid", ""))
+
+def parse_search_product(item: dict) -> dict | None:
+    """Parse product from search_items response item."""
+    item_basic = item.get("item_basic") or item
+    item_id = str(item_basic.get("itemid", ""))
+    shop_id = str(item_basic.get("shopid", ""))
+
+    if not item_id or not item_basic.get("name"):
+        return None
+
+    price = item_basic.get("price", 0) / 100000
+    price_before = item_basic.get("price_before_discount", 0) / 100000
+    image = item_basic.get("image", "")
+    images = item_basic.get("images", [])
+    sold = item_basic.get("sold", 0)
+    historical_sold = item_basic.get("historical_sold", 0)
+    discount = item_basic.get("raw_discount", 0)
+    shop_rating = item_basic.get("shopee_verified")
+    seller_type = ""
+    if item_basic.get("is_official_shop"):
+        seller_type = "MALL"
+    elif item_basic.get("shopee_verified"):
+        seller_type = "PREFERRED"
+
+    # sold text
+    if historical_sold >= 1000:
+        sold_text = f"Đã bán {historical_sold // 1000}k+"
+    elif historical_sold > 0:
+        sold_text = f"Đã bán {historical_sold}"
+    else:
+        sold_text = ""
 
     return {
         "item_id": item_id,
         "shop_id": shop_id,
-        "name": asset.get("name", ""),
+        "name": item_basic.get("name", ""),
         "price": price,
-        "original_price": original_price,
-        "discount": discount,
-        "sold": sold,
+        "original_price": price_before if price_before > price else None,
+        "discount": f"-{discount}%" if discount else "",
+        "sold": sold_text,
         "seller_type": seller_type,
         "image": f"{IMAGE_BASE}{image}" if image else "",
-        "images": json.dumps([f"{IMAGE_BASE}{img}" for img in images]),
-        "url": f"https://shopee.vn/product/{shop_id}/{item_id}" if shop_id and item_id else "",
+        "images": json.dumps([f"{IMAGE_BASE}{i}" for i in images]),
+        "url": f"https://shopee.vn/product/{shop_id}/{item_id}",
     }
 
 
-def process_recommend_response(resp_body: str, req_body: str | None) -> int:
-    """Parse recommend_v2 response and insert products into DB."""
-    global product_count
+# ─── Response processors ──────────────────────────────────────────────────────
 
+def process_response(url: str, resp_body: str, req_body: str | None) -> tuple[int, int]:
+    """Process API response, return (new_count, total_in_response)."""
     if not resp_body or "90309999" in resp_body:
-        return 0
+        return 0, 0
 
     try:
         resp = json.loads(resp_body)
     except json.JSONDecodeError:
-        return 0
+        return 0, 0
 
-    units = resp.get("data", {}).get("units", [])
-    if not units:
-        return 0
-
-    # Extract category ID from request body
+    products = []
     cat_id = ""
-    if req_body:
+
+    if "recommend/recommend_v2" in url:
+        units = resp.get("data", {}).get("units", [])
+        for u in units:
+            p = parse_recommend_product(u)
+            if p:
+                products.append(p)
+        # Category from request body
+        if req_body:
+            try:
+                cat_id = str(json.loads(req_body).get("catid", ""))
+            except Exception:
+                pass
+
+    elif "search/search_items" in url:
+        items = resp.get("items") or resp.get("data", {}).get("items", [])
+        for item in items:
+            p = parse_search_product(item)
+            if p:
+                products.append(p)
+        # Category from URL params
         try:
-            cat_id = str(json.loads(req_body).get("catid", ""))
+            qs = parse_qs(urlparse(url).query)
+            cat_id = qs.get("match_id", [""])[0]
         except Exception:
             pass
 
-    now = datetime.now().isoformat()
-    new_count = 0
+    if not products:
+        return 0, 0
 
-    for u in units:
-        product = parse_product(u)
-        if not product:
-            continue
+    new = insert_products(products, cat_id)
+    return new, len(products)
 
-        try:
-            db_conn.execute(
-                """INSERT OR IGNORE INTO products
-                   (item_id, shop_id, name, price, original_price, discount,
-                    sold, seller_type, image, images, url, category_id, captured_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    product["item_id"], product["shop_id"], product["name"],
-                    product["price"], product["original_price"], product["discount"],
-                    product["sold"], product["seller_type"], product["image"],
-                    product["images"], product["url"], cat_id, now,
-                ),
-            )
-            if db_conn.total_changes > product_count + new_count:
-                new_count += 1
-        except Exception:
-            pass
 
-    db_conn.commit()
-    product_count += new_count
-    return new_count
-
+# ─── HTTP Server ───────────────────────────────────────────────────────────────
 
 def status_style(code: int) -> str:
     if 200 <= code < 300:
@@ -168,15 +234,6 @@ def status_style(code: int) -> str:
     if 300 <= code < 400:
         return "yellow"
     return "red"
-
-
-def json_preview(text: str, max_len: int = 120) -> str:
-    try:
-        data = json.loads(text)
-        s = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    except Exception:
-        s = text
-    return s[:max_len] + "..." if len(s) > max_len else s
 
 
 class CaptureHandler(BaseHTTPRequestHandler):
@@ -208,11 +265,10 @@ class CaptureHandler(BaseHTTPRequestHandler):
         resp_body = data.get("responseBody", "")
         req_body = data.get("requestBody")
 
-        # Display
+        # Only show shopee API calls
         if "shopee.vn/api" in url:
             st = status_style(status)
-            url_display = url.split("?")[0] if len(url) > 100 else url
-            url_short = url_display.split("shopee.vn")[-1] if "shopee.vn" in url_display else url_display
+            url_short = url.split("shopee.vn")[-1].split("?")[0] if "shopee.vn" in url else url
 
             console.print(
                 f"  [cyan]#{counter:>3}[/] "
@@ -221,14 +277,21 @@ class CaptureHandler(BaseHTTPRequestHandler):
                 f"[white]{url_short}[/]"
             )
 
-        # Auto-extract products from recommend_v2
-        if "recommend/recommend_v2" in url and status == 200:
-            new = process_recommend_response(resp_body, req_body)
-            if new > 0:
-                total = db_conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        # Check if this is a product API
+        is_product_api = any(api in url for api in PRODUCT_APIS)
+
+        if is_product_api and status == 200:
+            if "90309999" in (resp_body or ""):
+                console.print(f"       [red]BLOCKED (anti-bot)[/]")
+            elif not resp_body:
+                console.print(f"       [yellow]empty response[/]")
+            else:
+                new, total_resp = process_response(url, resp_body, req_body)
+                total_db = db_conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+                dupes = total_resp - new
                 console.print(
-                    f"       [green bold]＋{new} products[/] "
-                    f"[dim]({total} total in DB)[/]"
+                    f"       [green bold]＋{new} new[/] "
+                    f"[dim]({dupes} dupes, {total_resp} parsed, {total_db} in DB)[/]"
                 )
 
     def do_OPTIONS(self):
@@ -241,6 +304,8 @@ class CaptureHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
 
 def show_stats():
     if not db_conn:
@@ -265,7 +330,7 @@ def main(db_path: str, port: int):
         f"[bold cyan]Shopee Product Proxy[/]\n"
         f"Server:   [green]http://localhost:{port}[/]\n"
         f"Database: [green]{db_abs}[/] ({existing} products)\n"
-        f"Extension: [green]{ext_path}[/]\n\n"
+        f"Captures: [yellow]recommend_v2 + search_items[/]\n\n"
         f"[yellow]Setup (one time):[/]\n"
         f"  1. [bold]chrome://extensions[/] → Developer mode → Load unpacked\n"
         f"  2. Select [bold]extension/[/] folder\n"
